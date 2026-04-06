@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 from typing import Any
 
 import numpy as np
 import sounddevice as sd
+
+log = logging.getLogger("cave_talk.audio")
 
 from .config import Config
 
@@ -61,7 +64,7 @@ class AudioCapture:
 
     def _callback(self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags) -> None:
         if status:
-            pass  # could log dropped frames, etc.
+            log.warning("Audio callback status: %s", status)
         with self._acc_lock:
             self._accumulator = np.concatenate([self._accumulator, indata.copy()])
             while len(self._accumulator) >= self._chunk_samples:
@@ -79,12 +82,25 @@ class AudioCapture:
             callback=self._callback,
         )
         self._stream.start()
+        log.info("Audio stream started: device=%s, rate=%d, channels=%d, active=%s",
+                 device, self.config.sample_rate, self.config.channels,
+                 self._stream.active)
 
     def stop(self) -> None:
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+
+
+def refresh_devices() -> None:
+    """Force PortAudio to re-scan hardware devices.
+
+    After an unplug/replug cycle the cached device list can become stale,
+    causing 'Invalid Property Value' errors when opening a stream.
+    """
+    sd._terminate()
+    sd._initialize()
 
 
 def list_devices() -> list[dict]:

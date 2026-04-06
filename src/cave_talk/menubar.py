@@ -5,10 +5,12 @@ from __future__ import annotations
 import subprocess
 import threading
 import logging
+from datetime import datetime, timezone
 
+from Foundation import NSRunLoop, NSRunLoopCommonModes
 import rumps
 
-from .audio import AudioCapture, list_devices
+from .audio import AudioCapture, list_devices, refresh_devices
 from .config import Config, ensure_dirs
 from .log import setup_logging
 from .storage import list_transcripts, save_transcript
@@ -83,8 +85,20 @@ class CaveTalkApp(rumps.App):
 
         self._populate_transcripts()
 
+        # Ensure timers fire even while the menu is open (macOS switches
+        # the run loop to NSEventTrackingRunLoopMode during menu tracking,
+        # but rumps only registers timers in NSDefaultRunLoopMode).
+        rumps.events.before_start.register(self._enable_timer_during_menu)
+
         # Auto-start listening
         self._start_listening()
+
+    def _enable_timer_during_menu(self):
+        """Re-register all rumps timers in NSRunLoopCommonModes."""
+        run_loop = NSRunLoop.currentRunLoop()
+        for t in rumps.timers():
+            if t.is_alive and hasattr(t, '_nstimer'):
+                run_loop.addTimer_forMode_(t._nstimer, NSRunLoopCommonModes)
 
     def _init_device_menu(self):
         """Populate the device submenu (safe during __init__)."""
@@ -99,7 +113,12 @@ class CaveTalkApp(rumps.App):
             self._device_menu.add(item)
 
     def _rebuild_device_menu(self):
-        """Rebuild device submenu after app is running."""
+        """Rebuild device submenu after app is running.
+
+        Does NOT call refresh_devices() here — that would invalidate any
+        active PortAudio stream.  The caller is responsible for refreshing
+        before the stream is opened.
+        """
         self._device_menu.clear()
         self._init_device_menu()
 
@@ -122,6 +141,12 @@ class CaveTalkApp(rumps.App):
         return callback
 
     def _start_listening(self):
+        # Re-scan hardware so unplugged/replugged devices are picked up
+        try:
+            refresh_devices()
+        except Exception as e:
+            log.warning("Device refresh failed (non-fatal): %s", e)
+
         devs = list_devices()
         if not devs:
             rumps.notification("cave-talk", "Error", "No audio input devices found.")
@@ -144,9 +169,27 @@ class CaveTalkApp(rumps.App):
         try:
             self.capture.start()
         except Exception as e:
-            log.error("Failed to start capture: %s", e)
-            rumps.notification("cave-talk", "Error", f"Failed to start: {e}")
-            return
+            log.warning("Failed to start capture on device %d (%s): %s",
+                        self.config.device, self._device_name, e)
+            # Fall back to default device
+            default_dev = next((d for d in devs if d["default"]), devs[0])
+            if default_dev["index"] != self.config.device:
+                log.info("Retrying with default device %d (%s)",
+                         default_dev["index"], default_dev["name"])
+                self.config.device = default_dev["index"]
+                self._device_name = default_dev["name"]
+                self.config.save()
+                self.capture = AudioCapture(self.config)
+                try:
+                    self.capture.start()
+                except Exception as e2:
+                    log.error("Failed to start capture on default device: %s", e2)
+                    rumps.notification("cave-talk", "Error", f"Failed to start: {e2}")
+                    return
+            else:
+                log.error("Failed to start capture: %s", e)
+                rumps.notification("cave-talk", "Error", f"Failed to start: {e}")
+                return
 
         self._is_listening = True
         self._listen_item.title = "Stop Listening"
@@ -275,6 +318,33 @@ class CaveTalkApp(rumps.App):
             if self.wake_detector:
                 self.wake_detector.clear_cooldown()
 
+    @staticmethod
+    def _friendly_time(iso_str: str) -> str:
+        """Format an ISO timestamp as a friendly relative or absolute string."""
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            delta = now - dt
+            seconds = delta.total_seconds()
+
+            if seconds < 60:
+                return "just now"
+            if seconds < 3600:
+                m = int(seconds // 60)
+                return f"{m}m ago"
+            if seconds < 86400:
+                h = int(seconds // 3600)
+                return f"{h}h ago"
+            if seconds < 172800:
+                return "yesterday " + dt.astimezone().strftime("%-I:%M %p").lower()
+            if seconds < 604800:
+                return dt.astimezone().strftime("%A %-I:%M %p").lower()
+            return dt.astimezone().strftime("%b %-d, %-I:%M %p").lower()
+        except (ValueError, TypeError):
+            return ""
+
     def _populate_transcripts(self):
         """Add transcript items to the submenu."""
         transcripts = list_transcripts()[:5]
@@ -288,10 +358,11 @@ class CaveTalkApp(rumps.App):
         for t in transcripts:
             dur = int(t.get("duration_seconds", 0))
             mins, secs = divmod(dur, 60)
+            when = self._friendly_time(t.get("created_at", ""))
             preview = t.get("full_text", "")[:40]
             if len(t.get("full_text", "")) > 40:
                 preview += "..."
-            label = f"{t['id'][:15]}  {mins}m{secs}s  {preview}"
+            label = f"{when} ({mins}m{secs:02d}s) {preview}"
             self._transcripts_menu.add(rumps.MenuItem(label, callback=None))
 
     def _refresh_transcripts(self):
@@ -308,9 +379,9 @@ class CaveTalkApp(rumps.App):
         from .config import TRANSCRIPTS_DIR
         subprocess.Popen(["open", str(TRANSCRIPTS_DIR)])
 
-    @rumps.timer(2)
+    @rumps.timer(1)
     def _update_buffer(self, sender):
-        """Update buffer time display."""
+        """Update buffer and status display."""
         if not self._is_listening or not self.capture:
             return
         buffered = self.capture.buffer.seconds_buffered
