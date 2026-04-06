@@ -110,6 +110,25 @@ cave-talk delete ID                       Delete a transcript
 cave-talk search QUERY                    Search transcripts by content
 ```
 
+## Menu bar app
+
+cave-talk also runs as a Mac menu bar app — always-on, no terminal window needed.
+
+```bash
+cave-talk-menu
+```
+
+The menu bar icon provides:
+
+- **Status** — shows current device and buffer time
+- **Capture Now** — trigger a capture with one click
+- **Wake phrase detection** — toggle on/off
+- **Device switcher** — change audio input without restarting
+- **Recent transcripts** — quick access to the last 5
+- **Open Transcripts Folder** — jump to the JSON files in Finder
+
+The app auto-starts listening on launch using your saved device from `~/.cave-talk/config.json`. Captures trigger a macOS notification with a transcript preview plus TTS confirmation.
+
 ## Configuration
 
 Stored at `~/.cave-talk/config.json` (auto-created on first run):
@@ -171,6 +190,7 @@ The editable install (`-e`) means changes to `src/cave_talk/` take effect immedi
 ```
 src/cave_talk/
   cli.py          Typer CLI: listen, devices, list, show, delete, search
+  menubar.py      Mac menu bar app (rumps)
   audio.py        AudioCapture + AudioBuffer (rolling deque of 1-sec numpy chunks)
   transcribe.py   whisper.cpp subprocess wrapper, WAV export, JSON parsing
   storage.py      Transcript CRUD (JSON files in ~/.cave-talk/transcripts/)

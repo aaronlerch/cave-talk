@@ -12,7 +12,9 @@ dependencies = [
     "numpy>=1.24",
     "typer>=0.9",
     "rich>=13.0",
+    "rumps>=0.4.0",
 ]
 
 [project.scripts]
 cave-talk = "cave_talk.cli:app"
+cave-talk-menu = "cave_talk.menubar:main"
