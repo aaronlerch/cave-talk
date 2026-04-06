@@ -56,7 +56,7 @@ class CaveTalkApp(rumps.App):
         self._capture_item.set_callback(None)  # disabled until listening
 
         self._device_menu = rumps.MenuItem("Device")
-        self._build_device_menu()
+        self._init_device_menu()
 
         self._transcripts_menu = rumps.MenuItem("Recent Transcripts")
 
@@ -81,14 +81,13 @@ class CaveTalkApp(rumps.App):
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
 
-        self._refresh_transcripts()
+        self._populate_transcripts()
 
         # Auto-start listening
         self._start_listening()
 
-    def _build_device_menu(self):
-        """Populate the device submenu."""
-        self._device_menu.clear()
+    def _init_device_menu(self):
+        """Populate the device submenu (safe during __init__)."""
         devs = list_devices()
         for d in devs:
             label = d["name"]
@@ -98,6 +97,11 @@ class CaveTalkApp(rumps.App):
             if self.config.device == d["index"]:
                 item.state = 1
             self._device_menu.add(item)
+
+    def _rebuild_device_menu(self):
+        """Rebuild device submenu after app is running."""
+        self._device_menu.clear()
+        self._init_device_menu()
 
     def _make_device_callback(self, device_index: int, device_name: str):
         def callback(sender):
@@ -156,7 +160,7 @@ class CaveTalkApp(rumps.App):
             self._start_wake()
 
         # Update device menu checkmarks
-        self._build_device_menu()
+        self._rebuild_device_menu()
 
     def _stop_listening(self):
         if self.wake_detector:
@@ -271,10 +275,9 @@ class CaveTalkApp(rumps.App):
             if self.wake_detector:
                 self.wake_detector.clear_cooldown()
 
-    def _refresh_transcripts(self):
-        """Update the recent transcripts submenu."""
-        self._transcripts_menu.clear()
-        transcripts = list_transcripts()[:5]  # last 5
+    def _populate_transcripts(self):
+        """Add transcript items to the submenu."""
+        transcripts = list_transcripts()[:5]
 
         if not transcripts:
             item = rumps.MenuItem("No transcripts yet", callback=None)
@@ -290,6 +293,11 @@ class CaveTalkApp(rumps.App):
                 preview += "..."
             label = f"{t['id'][:15]}  {mins}m{secs}s  {preview}"
             self._transcripts_menu.add(rumps.MenuItem(label, callback=None))
+
+    def _refresh_transcripts(self):
+        """Rebuild transcripts submenu (safe only after app is running)."""
+        self._transcripts_menu.clear()
+        self._populate_transcripts()
 
         self._transcripts_menu.add(None)  # separator
         self._transcripts_menu.add(
