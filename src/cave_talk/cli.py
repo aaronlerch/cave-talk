@@ -8,7 +8,9 @@ import time
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
+from rich.text import Text
 
 from .audio import AudioCapture, list_devices
 from .config import Config, ensure_dirs
@@ -56,6 +58,36 @@ def devices():
     console.print(table)
 
 
+def _pick_device(devs: list[dict]) -> dict:
+    """Interactive device picker. Returns the chosen device dict."""
+    console.print("\n[bold]Select an audio input device:[/bold]\n")
+    for i, d in enumerate(devs):
+        marker = " [magenta](default)[/magenta]" if d["default"] else ""
+        console.print(f"  [cyan]{d['index']}[/cyan]  {d['name']}{marker}")
+    console.print()
+
+    while True:
+        try:
+            choice = input("Device index (or Enter for default): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise typer.Exit(0)
+
+        if choice == "":
+            return next(d for d in devs if d["default"])
+
+        try:
+            idx = int(choice)
+            match = next((d for d in devs if d["index"] == idx), None)
+            if match:
+                return match
+        except ValueError:
+            pass
+        console.print("[red]Invalid choice. Try again.[/red]")
+
+
+_SPINNER_FRAMES = ["   ", ".  ", ".. ", "...", " ..", "  .", "   ", "  .", " ..", "...", ".. ", ".  "]
+
+
 @app.command()
 def listen(
     device: int | None = typer.Option(None, "--device", "-d", help="Audio device index (use 'devices' to list)"),
@@ -63,19 +95,32 @@ def listen(
 ):
     """Start listening and buffering audio. Press Enter to capture and transcribe."""
     config = Config.load()
-    if device is not None:
-        config.device = device
     config.buffer_duration = duration
     ensure_dirs()
 
-    # Resolve device name for display
     devs = list_devices()
-    if config.device is not None:
+    if not devs:
+        console.print("[red]No audio input devices found.[/red]")
+        raise typer.Exit(1)
+
+    # Device selection: explicit flag > saved config > interactive picker
+    if device is not None:
+        config.device = device
+        dev_info = next((d for d in devs if d["index"] == device), None)
+        if not dev_info:
+            console.print(f"[red]Device index {device} not found. Run 'cave-talk devices' to list.[/red]")
+            raise typer.Exit(1)
+    elif config.device is not None:
         dev_info = next((d for d in devs if d["index"] == config.device), None)
-        device_name = dev_info["name"] if dev_info else f"Device {config.device}"
+        if not dev_info:
+            console.print(f"[yellow]Saved device {config.device} not found. Pick a new one.[/yellow]")
+            dev_info = _pick_device(devs)
+            config.device = dev_info["index"]
     else:
-        dev_info = next((d for d in devs if d["default"]), None)
-        device_name = dev_info["name"] if dev_info else "System Default"
+        dev_info = _pick_device(devs)
+        config.device = dev_info["index"]
+
+    device_name = dev_info["name"]
 
     capture = AudioCapture(config)
     try:
@@ -84,21 +129,36 @@ def listen(
         console.print(f"[red]Failed to start audio capture: {e}[/red]")
         raise typer.Exit(1)
 
-    console.print(f"[green]Listening on: {device_name}[/green]")
-    console.print(f"[dim]Buffer: {duration}s ({duration // 60}m) | Sample rate: {config.sample_rate}Hz[/dim]")
-    console.print("[yellow]Press Enter to capture and transcribe. Ctrl+C to quit.[/yellow]\n")
+    console.print(f"\n[green]Listening on:[/green] {device_name}")
+    console.print(f"[dim]Buffer: {duration // 60}m | Press Enter to capture. Ctrl+C to quit.[/dim]\n")
 
     stop_event = threading.Event()
+    spinner_idx = 0
+
+    def make_status() -> Text:
+        nonlocal spinner_idx
+        buffered = capture.buffer.seconds_buffered
+        mins, secs = divmod(buffered, 60)
+        max_mins = duration // 60
+        frame = _SPINNER_FRAMES[spinner_idx % len(_SPINNER_FRAMES)]
+        spinner_idx += 1
+
+        bar_width = 20
+        fill = int(bar_width * buffered / duration) if duration > 0 else 0
+        bar = "[green]" + "=" * fill + "[/green]" + "[dim]" + "-" * (bar_width - fill) + "[/dim]"
+
+        text = Text.from_markup(
+            f"  [cyan]{frame}[/cyan]  {bar}  [bold]{mins:02d}:{secs:02d}[/bold] / {max_mins:02d}:00"
+        )
+        return text
+
+    live = Live(make_status(), console=console, refresh_per_second=4, transient=True)
+    live.start()
 
     def status_loop():
         while not stop_event.is_set():
-            buffered = capture.buffer.seconds_buffered
-            mins, secs = divmod(buffered, 60)
-            console.print(
-                f"\r[dim]Buffered: {mins:02d}:{secs:02d} / {duration // 60:02d}:00[/dim]",
-                end="",
-            )
-            stop_event.wait(1.0)
+            live.update(make_status())
+            stop_event.wait(0.25)
 
     status_thread = threading.Thread(target=status_loop, daemon=True)
     status_thread.start()
@@ -106,11 +166,13 @@ def listen(
     try:
         while True:
             input()  # Wait for Enter
-            console.print("\n[cyan]Capturing...[/cyan]")
+            live.stop()
+            console.print("[cyan]Capturing...[/cyan]")
 
             audio = capture.buffer.snapshot()
             if audio is None or len(audio) == 0:
-                console.print("[yellow]No audio in buffer yet.[/yellow]")
+                console.print("[yellow]No audio in buffer yet.[/yellow]\n")
+                live.start()
                 continue
 
             buffered_secs = len(audio) / config.sample_rate
@@ -120,24 +182,26 @@ def listen(
             try:
                 transcript = transcribe(audio, config)
             except RuntimeError as e:
-                console.print(f"[red]{e}[/red]")
+                console.print(f"[red]{e}[/red]\n")
+                live.start()
                 continue
 
             record = save_transcript(transcript, device_name=device_name)
-            console.print(f"\n[green]Transcript saved: {record['id']}[/green]")
+            console.print(f"[green]Transcript saved: {record['id']}[/green]")
             console.print(f"[dim]Duration: {mins}m {secs}s | Segments: {len(transcript.segments)}[/dim]")
 
-            # Show preview
             preview = transcript.full_text[:200]
             if len(transcript.full_text) > 200:
                 preview += "..."
-            console.print(f"\n[white]{preview}[/white]\n")
-            console.print("[yellow]Press Enter to capture again. Ctrl+C to quit.[/yellow]")
+            console.print(f"\n[white]{preview}[/white]")
+            console.print(f"\n[dim]Press Enter to capture again. Ctrl+C to quit.[/dim]\n")
+            live.start()
 
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
+        live.stop()
         capture.stop()
         console.print("\n[dim]Stopped.[/dim]")
 
