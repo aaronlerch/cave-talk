@@ -22,6 +22,7 @@ from .storage import (
     save_transcript,
     search_transcripts,
 )
+from .log import setup_logging
 from .transcribe import transcribe
 from .wake import WakePhraseDetector
 
@@ -140,6 +141,7 @@ def listen(
     phrase: str | None = typer.Option(None, "--phrase", "-p", help="Override wake phrase"),
 ):
     """Start listening and buffering audio. Press Enter or use wake phrase to capture."""
+    log = setup_logging()
     config = Config.load()
     config.buffer_duration = duration
     if phrase is not None:
@@ -169,6 +171,7 @@ def listen(
         config.device = dev_info["index"]
 
     device_name = dev_info["name"]
+    config.save()
 
     capture = AudioCapture(config)
     try:
@@ -177,12 +180,19 @@ def listen(
         console.print(f"[red]Failed to start audio capture: {e}[/red]")
         raise typer.Exit(1)
 
+    log.info("Listening on device %d: %s (wake=%s)", config.device, device_name, wake)
+
     console.print(f"\n[green]Listening on:[/green] {device_name}")
     mode_info = f"Buffer: {duration // 60}m"
     if wake:
         mode_info += f" | Wake: \"{config.wake_phrase}\""
     mode_info += " | Press Enter to capture. Ctrl+C to quit."
-    console.print(f"[dim]{mode_info}[/dim]\n")
+    console.print(f"[dim]{mode_info}[/dim]")
+
+    from .config import LOG_DIR
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    console.print(f"[dim]Logs: {LOG_DIR / f'{today}.log'}[/dim]\n")
 
     stop_event = threading.Event()
     spinner_idx = 0
