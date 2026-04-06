@@ -20,7 +20,7 @@ class Config:
     wake_phrase: str = "ndeko capture this conversation"
     whisper_model: str = "small.en"  # model for transcription
     wake_model: str = "tiny.en"  # lighter model for wake phrase detection
-    whisper_bin: str = "whisper-cpp"  # path or command name
+    whisper_bin: str = "whisper-cli"  # path or command name
 
     @classmethod
     def load(cls) -> Config:

@@ -93,18 +93,20 @@ def transcribe(audio: np.ndarray, config: Config) -> Transcript:
     """Transcribe audio using whisper.cpp."""
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = Path(tmpdir) / "capture.wav"
+        output_base = Path(tmpdir) / "capture"
         write_wav(wav_path, audio, config.sample_rate, config.channels)
 
         duration = len(audio) / config.sample_rate
 
-        # Try JSON output first
         try:
+            # -oj writes JSON to <output_base>.json
             result = subprocess.run(
                 [
                     config.whisper_bin,
-                    "-m", _model_path(config),
+                    "-m", resolve_model_path(config.whisper_model),
                     "-f", str(wav_path),
-                    "-oj",  # output JSON
+                    "-of", str(output_base),
+                    "-oj",
                     "--no-prints",
                 ],
                 capture_output=True,
@@ -112,20 +114,13 @@ def transcribe(audio: np.ndarray, config: Config) -> Transcript:
                 timeout=300,
             )
 
-            segments = _parse_whisper_json(result.stdout)
+            json_path = Path(str(output_base) + ".json")
+            segments = []
+            if json_path.exists():
+                segments = _parse_whisper_json(json_path.read_text())
+
             if not segments:
-                # Fallback to plain text output
-                result = subprocess.run(
-                    [
-                        config.whisper_bin,
-                        "-m", _model_path(config),
-                        "-f", str(wav_path),
-                        "--no-prints",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
+                # Fallback: parse stdout text directly
                 segments = _parse_whisper_text(result.stdout)
         except FileNotFoundError:
             raise RuntimeError(
@@ -144,14 +139,11 @@ def transcribe(audio: np.ndarray, config: Config) -> Transcript:
     )
 
 
-def _model_path(config: Config) -> str:
-    """Resolve model path. Checks common whisper.cpp model locations."""
-    # If it's already an absolute path, use it
-    model = config.whisper_model
+def resolve_model_path(model: str) -> str:
+    """Resolve a model name to a file path. Checks common whisper.cpp model locations."""
     if Path(model).is_absolute() and Path(model).exists():
         return model
 
-    # Check Homebrew whisper.cpp model locations
     candidates = [
         Path.home() / ".cache" / "whisper.cpp" / f"ggml-{model}.bin",
         Path(f"/opt/homebrew/share/whisper-cpp/models/ggml-{model}.bin"),
@@ -163,5 +155,4 @@ def _model_path(config: Config) -> str:
         if candidate.exists():
             return str(candidate)
 
-    # Return as-is and let whisper.cpp deal with it
     return f"ggml-{model}.bin"

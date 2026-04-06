@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ from .storage import (
     search_transcripts,
 )
 from .transcribe import transcribe
+from .wake import WakePhraseDetector
 
 app = typer.Typer(
     name="cave-talk",
@@ -85,17 +87,63 @@ def _pick_device(devs: list[dict]) -> dict:
         console.print("[red]Invalid choice. Try again.[/red]")
 
 
-_SPINNER_FRAMES = ["   ", ".  ", ".. ", "...", " ..", "  .", "   ", "  .", " ..", "...", ".. ", ".  "]
+_SPINNER_FRAMES = [
+    "[red]*[/red]  [dim]*  *[/dim]",
+    "[dim]*[/dim]  [red]*[/red]  [dim]*[/dim]",
+    "[dim]*  *[/dim]  [red]*[/red]",
+    "[dim]*[/dim]  [red]*[/red]  [dim]*[/dim]",
+]
+
+
+def _say(text: str) -> None:
+    """Speak text aloud using macOS TTS (non-blocking)."""
+    try:
+        subprocess.Popen(["say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+
+def _do_capture(capture: AudioCapture, config: Config, device_name: str, console: Console) -> None:
+    """Snapshot buffer, transcribe, save, print results."""
+    audio = capture.buffer.snapshot()
+    if audio is None or len(audio) == 0:
+        console.print("[yellow]No audio in buffer yet.[/yellow]")
+        return
+
+    buffered_secs = len(audio) / config.sample_rate
+    mins, secs = divmod(int(buffered_secs), 60)
+    console.print(f"[dim]Got {mins}m {secs}s of audio. Transcribing...[/dim]")
+
+    try:
+        transcript = transcribe(audio, config)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+
+    record = save_transcript(transcript, device_name=device_name)
+    console.print(f"[green]Transcript saved: {record['id']}[/green]")
+    console.print(f"[dim]Duration: {mins}m {secs}s | Segments: {len(transcript.segments)}[/dim]")
+
+    preview = transcript.full_text[:200]
+    if len(transcript.full_text) > 200:
+        preview += "..."
+    console.print(f"\n[white]{preview}[/white]")
+
+    _say(f"I've saved the last {mins} minutes of transcript for you.")
 
 
 @app.command()
 def listen(
     device: int | None = typer.Option(None, "--device", "-d", help="Audio device index (use 'devices' to list)"),
     duration: int = typer.Option(900, "--duration", help="Buffer duration in seconds (default: 900 = 15 min)"),
+    wake: bool = typer.Option(False, "--wake", "-w", help="Enable wake phrase detection"),
+    phrase: str | None = typer.Option(None, "--phrase", "-p", help="Override wake phrase"),
 ):
-    """Start listening and buffering audio. Press Enter to capture and transcribe."""
+    """Start listening and buffering audio. Press Enter or use wake phrase to capture."""
     config = Config.load()
     config.buffer_duration = duration
+    if phrase is not None:
+        config.wake_phrase = phrase
     ensure_dirs()
 
     devs = list_devices()
@@ -130,27 +178,28 @@ def listen(
         raise typer.Exit(1)
 
     console.print(f"\n[green]Listening on:[/green] {device_name}")
-    console.print(f"[dim]Buffer: {duration // 60}m | Press Enter to capture. Ctrl+C to quit.[/dim]\n")
+    mode_info = f"Buffer: {duration // 60}m"
+    if wake:
+        mode_info += f" | Wake: \"{config.wake_phrase}\""
+    mode_info += " | Press Enter to capture. Ctrl+C to quit."
+    console.print(f"[dim]{mode_info}[/dim]\n")
 
     stop_event = threading.Event()
     spinner_idx = 0
+    wake_triggered = threading.Event()
+    wake_detector: WakePhraseDetector | None = None
 
     def make_status() -> Text:
         nonlocal spinner_idx
         buffered = capture.buffer.seconds_buffered
         mins, secs = divmod(buffered, 60)
-        max_mins = duration // 60
         frame = _SPINNER_FRAMES[spinner_idx % len(_SPINNER_FRAMES)]
         spinner_idx += 1
 
-        bar_width = 20
-        fill = int(bar_width * buffered / duration) if duration > 0 else 0
-        bar = "[green]" + "=" * fill + "[/green]" + "[dim]" + "-" * (bar_width - fill) + "[/dim]"
-
-        text = Text.from_markup(
-            f"  [cyan]{frame}[/cyan]  {bar}  [bold]{mins:02d}:{secs:02d}[/bold] / {max_mins:02d}:00"
+        wake_indicator = "  [green]wake[/green]" if wake else ""
+        return Text.from_markup(
+            f"  {frame}  [dim]window:[/dim] [bold]{mins:02d}:{secs:02d}[/bold]{wake_indicator}"
         )
-        return text
 
     live = Live(make_status(), console=console, refresh_per_second=4, transient=True)
     live.start()
@@ -163,44 +212,63 @@ def listen(
     status_thread = threading.Thread(target=status_loop, daemon=True)
     status_thread.start()
 
+    # Wake phrase detection
+    if wake:
+        def on_wake():
+            wake_triggered.set()
+
+        wake_detector = WakePhraseDetector(
+            buffer=capture.buffer,
+            config=config,
+            on_wake=on_wake,
+        )
+        wake_detector.start()
+
+    def handle_capture():
+        live.stop()
+        console.print("[cyan]Capturing...[/cyan]")
+        _do_capture(capture, config, device_name, console)
+        console.print(f"\n[dim]Press Enter to capture again. Ctrl+C to quit.[/dim]\n")
+        if wake_detector:
+            wake_detector.clear_cooldown()
+        live.start()
+
     try:
         while True:
-            input()  # Wait for Enter
-            live.stop()
-            console.print("[cyan]Capturing...[/cyan]")
+            # Check for wake phrase trigger while also allowing Enter
+            if wake:
+                # Poll both wake trigger and stdin
+                while not wake_triggered.is_set():
+                    # Use a short timeout so we can check wake_triggered
+                    import select
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.25)
+                    if readable:
+                        sys.stdin.readline()
+                        break
+                    if stop_event.is_set():
+                        raise KeyboardInterrupt
 
-            audio = capture.buffer.snapshot()
-            if audio is None or len(audio) == 0:
-                console.print("[yellow]No audio in buffer yet.[/yellow]\n")
-                live.start()
-                continue
-
-            buffered_secs = len(audio) / config.sample_rate
-            mins, secs = divmod(int(buffered_secs), 60)
-            console.print(f"[dim]Got {mins}m {secs}s of audio. Transcribing...[/dim]")
-
-            try:
-                transcript = transcribe(audio, config)
-            except RuntimeError as e:
-                console.print(f"[red]{e}[/red]\n")
-                live.start()
-                continue
-
-            record = save_transcript(transcript, device_name=device_name)
-            console.print(f"[green]Transcript saved: {record['id']}[/green]")
-            console.print(f"[dim]Duration: {mins}m {secs}s | Segments: {len(transcript.segments)}[/dim]")
-
-            preview = transcript.full_text[:200]
-            if len(transcript.full_text) > 200:
-                preview += "..."
-            console.print(f"\n[white]{preview}[/white]")
-            console.print(f"\n[dim]Press Enter to capture again. Ctrl+C to quit.[/dim]\n")
-            live.start()
+                if wake_triggered.is_set():
+                    wake_triggered.clear()
+                    live.stop()
+                    console.print("\n[magenta]Wake phrase detected![/magenta]")
+                    console.print("[cyan]Capturing...[/cyan]")
+                    _do_capture(capture, config, device_name, console)
+                    console.print(f"\n[dim]Listening for wake phrase or Enter...[/dim]\n")
+                    wake_detector.clear_cooldown()
+                    live.start()
+                else:
+                    handle_capture()
+            else:
+                input()
+                handle_capture()
 
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
+        if wake_detector:
+            wake_detector.stop()
         live.stop()
         capture.stop()
         console.print("\n[dim]Stopped.[/dim]")

@@ -28,12 +28,16 @@ class AudioBuffer:
     def append(self, chunk: np.ndarray) -> None:
         self._chunks.append(chunk.copy())
 
-    def snapshot(self) -> np.ndarray | None:
-        """Return a copy of all buffered audio as a single array."""
+    def snapshot(self, last_n_seconds: int | None = None) -> np.ndarray | None:
+        """Return a copy of buffered audio. Optionally only the last N seconds."""
         with self._lock:
             if not self._chunks:
                 return None
-            return np.concatenate(list(self._chunks))
+            if last_n_seconds is not None and last_n_seconds < len(self._chunks):
+                chunks = list(self._chunks)[-last_n_seconds:]
+            else:
+                chunks = list(self._chunks)
+            return np.concatenate(chunks)
 
     def clear(self) -> None:
         with self._lock:
