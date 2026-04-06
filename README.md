@@ -114,11 +114,54 @@ cave-talk search QUERY                    Search transcripts by content
 
 cave-talk also runs as a Mac menu bar app — always-on, no terminal window needed.
 
+### Launch from terminal
+
 ```bash
 cave-talk-menu
 ```
 
-The menu bar icon provides:
+### Launch without a terminal (background)
+
+```bash
+nohup cave-talk-menu &>/dev/null &
+```
+
+### Launch at login automatically
+
+Create a Launch Agent so cave-talk starts every time you log in:
+
+```bash
+cat > ~/Library/LaunchAgents/com.cave-talk.menu.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cave-talk.menu</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/aaronlerch/.local/bin/cave-talk-menu</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+EOF
+
+# Load it now (starts immediately + on future logins)
+launchctl load ~/Library/LaunchAgents/com.cave-talk.menu.plist
+```
+
+To stop auto-launching:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.cave-talk.menu.plist
+rm ~/Library/LaunchAgents/com.cave-talk.menu.plist
+```
+
+### Menu bar features
 
 - **Status** — shows current device and buffer time
 - **Capture Now** — trigger a capture with one click
