@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import logging
 import threading
+import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import sounddevice as sd
@@ -14,6 +17,115 @@ log = logging.getLogger("cave_talk.audio")
 
 from .config import Config
 
+
+# ---------------------------------------------------------------------------
+# CoreAudio device-change listener (macOS only)
+# ---------------------------------------------------------------------------
+# Instead of polling sd.query_devices() (which segfaults during USB unplug),
+# we register a CoreAudio property listener that fires when the device list
+# changes.  This is notification-based — zero PortAudio calls in the hot path.
+
+_coreaudio = None
+_listener_callback_ref = None  # prevent GC of the ctypes callback
+
+# CoreAudio constants
+_kAudioObjectSystemObject = 1
+_kAudioHardwarePropertyDevices = int.from_bytes(b'dev#', 'big')
+_kAudioObjectPropertyScopeGlobal = int.from_bytes(b'glob', 'big')
+_kAudioObjectPropertyElementMain = 0
+
+
+class _AudioObjectPropertyAddress(ctypes.Structure):
+    _fields_ = [
+        ('mSelector', ctypes.c_uint32),
+        ('mScope', ctypes.c_uint32),
+        ('mElement', ctypes.c_uint32),
+    ]
+
+
+# Callback signature: OSStatus(AudioObjectID, UInt32, const AudioObjectPropertyAddress*, void*)
+_ListenerProc = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+)
+
+
+class DeviceChangeListener:
+    """Listens for macOS CoreAudio device list changes.
+
+    Calls ``on_change()`` from a CoreAudio thread whenever a device is
+    plugged or unplugged.  The callback should be fast (just set a flag).
+    """
+
+    def __init__(self, on_change: Callable[[], None]) -> None:
+        self._on_change = on_change
+        self._cb_ref: Any = None  # prevent GC
+        self._started = False
+
+    def start(self) -> bool:
+        """Register the listener.  Returns True on success."""
+        global _coreaudio
+        if _coreaudio is None:
+            path = ctypes.util.find_library('CoreAudio')
+            if not path:
+                log.warning("CoreAudio framework not found — device change detection disabled")
+                return False
+            _coreaudio = ctypes.cdll.LoadLibrary(path)
+
+        def _callback(obj_id, num_addr, addr_ptr, client_data):
+            log.info("CoreAudio: device list changed")
+            try:
+                self._on_change()
+            except Exception as e:
+                log.warning("CoreAudio callback error: %s", e)
+            return 0  # noErr
+
+        self._cb_ref = _ListenerProc(_callback)
+
+        address = _AudioObjectPropertyAddress(
+            _kAudioHardwarePropertyDevices,
+            _kAudioObjectPropertyScopeGlobal,
+            _kAudioObjectPropertyElementMain,
+        )
+
+        status = _coreaudio.AudioObjectAddPropertyListener(
+            _kAudioObjectSystemObject,
+            ctypes.byref(address),
+            self._cb_ref,
+            None,
+        )
+        if status != 0:
+            log.warning("AudioObjectAddPropertyListener failed: %d", status)
+            return False
+
+        self._started = True
+        log.info("CoreAudio device-change listener registered")
+        return True
+
+    def stop(self) -> None:
+        if not self._started or _coreaudio is None:
+            return
+        address = _AudioObjectPropertyAddress(
+            _kAudioHardwarePropertyDevices,
+            _kAudioObjectPropertyScopeGlobal,
+            _kAudioObjectPropertyElementMain,
+        )
+        _coreaudio.AudioObjectRemovePropertyListener(
+            _kAudioObjectSystemObject,
+            ctypes.byref(address),
+            self._cb_ref,
+            None,
+        )
+        self._started = False
+        log.info("CoreAudio device-change listener removed")
+
+
+# ---------------------------------------------------------------------------
+# AudioBuffer / AudioCapture
+# ---------------------------------------------------------------------------
 
 class AudioBuffer:
     """Rolling buffer of 1-second audio chunks stored as numpy arrays."""
@@ -61,10 +173,12 @@ class AudioCapture:
         self._chunk_samples = config.sample_rate  # 1 second per chunk
         self._accumulator = np.zeros((0, config.channels), dtype=np.float32)
         self._acc_lock = threading.Lock()
+        self.last_callback_time: float = 0.0
 
-    def _callback(self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags) -> None:
+    def _callback(self, indata: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
         if status:
             log.warning("Audio callback status: %s", status)
+        self.last_callback_time = time.monotonic()
         with self._acc_lock:
             self._accumulator = np.concatenate([self._accumulator, indata.copy()])
             while len(self._accumulator) >= self._chunk_samples:
@@ -82,29 +196,50 @@ class AudioCapture:
             callback=self._callback,
         )
         self._stream.start()
+        self.last_callback_time = time.monotonic()
         log.info("Audio stream started: device=%s, rate=%d, channels=%d, active=%s",
                  device, self.config.sample_rate, self.config.channels,
                  self._stream.active)
 
     def stop(self) -> None:
         if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+            except Exception as e:
+                log.warning("Error stopping stream (device may be gone): %s", e)
+            try:
+                self._stream.close()
+            except Exception as e:
+                log.warning("Error closing stream (device may be gone): %s", e)
             self._stream = None
+
+    def abandon(self) -> None:
+        """Release our reference without calling PortAudio stop/close.
+
+        Use this when the device is gone and PA calls would deadlock.
+        """
+        self._stream = None
 
 
 def refresh_devices() -> None:
     """Force PortAudio to re-scan hardware devices.
 
-    After an unplug/replug cycle the cached device list can become stale,
-    causing 'Invalid Property Value' errors when opening a stream.
+    IMPORTANT: Only call this when NO AudioCapture streams are active.
+    Calling while a stream exists will invalidate it (crash / deadlock).
+    After calling, sd.query_devices() and list_devices() return fresh data.
     """
+    log.info("refresh_devices: reinitializing PortAudio")
     sd._terminate()
     sd._initialize()
+    log.info("refresh_devices: done")
 
 
 def list_devices() -> list[dict]:
-    """Return a list of available audio input devices."""
+    """Return a list of available audio input devices.
+
+    NOTE: PortAudio caches its device list.  Call refresh_devices() first
+    if hardware may have changed since the last query.
+    """
     devices = sd.query_devices()
     inputs = []
     for i, d in enumerate(devices):

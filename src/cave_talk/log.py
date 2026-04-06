@@ -42,4 +42,14 @@ def setup_logging() -> logging.Logger:
     ))
 
     logger.addHandler(handler)
+
+    # Also log to stderr so crashes are visible in the terminal
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setLevel(level)
+    stderr_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logger.addHandler(stderr_handler)
+
     return logger

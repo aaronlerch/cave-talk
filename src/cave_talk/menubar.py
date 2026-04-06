@@ -5,12 +5,13 @@ from __future__ import annotations
 import subprocess
 import threading
 import logging
+import time
 from datetime import datetime, timezone
 
 from Foundation import NSRunLoop, NSRunLoopCommonModes
 import rumps
 
-from .audio import AudioCapture, list_devices, refresh_devices
+from .audio import AudioCapture, DeviceChangeListener, list_devices, refresh_devices
 from .config import Config, ensure_dirs
 from .log import setup_logging
 from .storage import list_transcripts, save_transcript
@@ -42,6 +43,12 @@ class CaveTalkApp(rumps.App):
         self._device_name: str = ""
         self._is_listening = False
         self._is_capturing = False
+        self._reconnecting = False
+
+        # Flags set by CoreAudio listener (from a CA thread), consumed by timer
+        self._device_list_changed = False
+        self._device_menu_stale = False
+        self._deferred_restart_device = False  # set by device menu click
 
         # Build menu
         self._status_item = rumps.MenuItem("Not listening", callback=None)
@@ -57,7 +64,7 @@ class CaveTalkApp(rumps.App):
         self._capture_item = rumps.MenuItem("Capture Now", callback=self.do_capture)
         self._capture_item.set_callback(None)  # disabled until listening
 
-        self._device_menu = rumps.MenuItem("Device")
+        self._device_menu = rumps.MenuItem("Device", callback=self._on_device_menu_click)
         self._init_device_menu()
 
         self._transcripts_menu = rumps.MenuItem("Recent Transcripts")
@@ -85,9 +92,12 @@ class CaveTalkApp(rumps.App):
 
         self._populate_transcripts()
 
-        # Ensure timers fire even while the menu is open (macOS switches
-        # the run loop to NSEventTrackingRunLoopMode during menu tracking,
-        # but rumps only registers timers in NSDefaultRunLoopMode).
+        # Register CoreAudio listener for device plug/unplug events.
+        # The callback just sets a flag — the timer handles it safely.
+        self._device_listener = DeviceChangeListener(on_change=self._on_coreaudio_device_change)
+        self._device_listener.start()
+
+        # Ensure timers fire even while the menu is open
         rumps.events.before_start.register(self._enable_timer_during_menu)
 
         # Auto-start listening
@@ -100,8 +110,22 @@ class CaveTalkApp(rumps.App):
             if t.is_alive and hasattr(t, '_nstimer'):
                 run_loop.addTimer_forMode_(t._nstimer, NSRunLoopCommonModes)
 
+    def _on_coreaudio_device_change(self):
+        """Called from CoreAudio thread when device list changes.
+
+        Must be fast and thread-safe — just set flags.
+        """
+        self._device_list_changed = True
+        self._device_menu_stale = True
+
+    # -- Device menu ----------------------------------------------------------
+
+    def _on_device_menu_click(self, sender):
+        """Unused — rumps doesn't fire callbacks on submenu parents."""
+        pass
+
     def _init_device_menu(self):
-        """Populate the device submenu (safe during __init__)."""
+        """Populate the device submenu."""
         devs = list_devices()
         for d in devs:
             label = d["name"]
@@ -113,14 +137,10 @@ class CaveTalkApp(rumps.App):
             self._device_menu.add(item)
 
     def _rebuild_device_menu(self):
-        """Rebuild device submenu after app is running.
-
-        Does NOT call refresh_devices() here — that would invalidate any
-        active PortAudio stream.  The caller is responsible for refreshing
-        before the stream is opened.
-        """
+        """Rebuild device submenu from live device list."""
         self._device_menu.clear()
         self._init_device_menu()
+        self._device_menu_stale = False
 
     def _make_device_callback(self, device_index: int, device_name: str):
         def callback(sender):
@@ -133,19 +153,24 @@ class CaveTalkApp(rumps.App):
                 item.state = 0
             sender.state = 1
 
-            # Restart listening with new device
+            # Defer the stop/start to after the menu closes.
+            # Calling refresh_devices() inside a menu callback crashes
+            # because sd._terminate() conflicts with Cocoa menu tracking.
             if self._is_listening:
-                self._stop_listening()
-                self._start_listening()
+                self._deferred_restart_device = True
 
         return callback
 
+    # -- Listening lifecycle --------------------------------------------------
+
     def _start_listening(self):
-        # Re-scan hardware so unplugged/replugged devices are picked up
-        try:
-            refresh_devices()
-        except Exception as e:
-            log.warning("Device refresh failed (non-fatal): %s", e)
+        # Refresh PA's device list if no stream is active (safe).
+        # This handles stale indices after stop/start or device changes.
+        if self.capture is None:
+            try:
+                refresh_devices()
+            except Exception as e:
+                log.warning("refresh_devices failed (non-fatal): %s", e)
 
         devs = list_devices()
         if not devs:
@@ -171,25 +196,21 @@ class CaveTalkApp(rumps.App):
         except Exception as e:
             log.warning("Failed to start capture on device %d (%s): %s",
                         self.config.device, self._device_name, e)
-            # Fall back to default device
-            default_dev = next((d for d in devs if d["default"]), devs[0])
-            if default_dev["index"] != self.config.device:
-                log.info("Retrying with default device %d (%s)",
-                         default_dev["index"], default_dev["name"])
-                self.config.device = default_dev["index"]
-                self._device_name = default_dev["name"]
-                self.config.save()
-                self.capture = AudioCapture(self.config)
-                try:
-                    self.capture.start()
-                except Exception as e2:
-                    log.error("Failed to start capture on default device: %s", e2)
-                    rumps.notification("cave-talk", "Error", f"Failed to start: {e2}")
-                    return
-            else:
-                log.error("Failed to start capture: %s", e)
-                rumps.notification("cave-talk", "Error", f"Failed to start: {e}")
+            # Fall back to system default
+            self.config.device = None
+            self.config.save()
+            self.capture = AudioCapture(self.config)
+            try:
+                self.capture.start()
+            except Exception as e2:
+                log.error("Failed to start capture on default device: %s", e2)
+                rumps.notification("cave-talk", "Error", f"Failed to start: {e2}")
                 return
+            # Resolve name of the device we ended up on
+            default_dev = next((d for d in devs if d["default"]), devs[0])
+            self._device_name = default_dev["name"]
+            self.config.device = default_dev["index"]
+            self.config.save()
 
         self._is_listening = True
         self._listen_item.title = "Stop Listening"
@@ -198,20 +219,26 @@ class CaveTalkApp(rumps.App):
         self.title = ICON_LISTENING
         log.info("Started listening on %s", self._device_name)
 
+        # Rebuild device menu with correct checkmarks
+        self._rebuild_device_menu()
+
         # Start wake detection if enabled
         if self._wake_enabled:
             self._start_wake()
 
-        # Update device menu checkmarks
-        self._rebuild_device_menu()
-
     def _stop_listening(self):
         if self.wake_detector:
-            self.wake_detector.stop()
+            try:
+                self.wake_detector.stop()
+            except Exception as e:
+                log.warning("Error stopping wake detector: %s", e)
             self.wake_detector = None
 
         if self.capture:
-            self.capture.stop()
+            try:
+                self.capture.stop()
+            except Exception as e:
+                log.warning("Error stopping capture: %s", e)
             self.capture = None
 
         self._is_listening = False
@@ -221,6 +248,8 @@ class CaveTalkApp(rumps.App):
         self._buffer_item.title = "Buffer: --:--"
         self.title = ICON_IDLE
         log.info("Stopped listening")
+
+    # -- Wake detection -------------------------------------------------------
 
     def _start_wake(self):
         if not self.capture:
@@ -242,8 +271,9 @@ class CaveTalkApp(rumps.App):
     def _on_wake_phrase(self):
         """Called from wake detector thread when phrase is detected."""
         log.info("Wake phrase detected!")
-        # Schedule capture on main thread
         rumps.Timer(0, lambda _: self._perform_capture(wake_triggered=True)).start()
+
+    # -- User actions ---------------------------------------------------------
 
     def toggle_listening(self, sender):
         if self._is_listening:
@@ -297,7 +327,6 @@ class CaveTalkApp(rumps.App):
             )
             log.info("Transcript saved: %s (%s)", record["id"], trigger)
 
-            # TTS feedback
             try:
                 subprocess.Popen(
                     ["say", f"I've saved the last {mins} minutes of transcript for you."],
@@ -317,6 +346,8 @@ class CaveTalkApp(rumps.App):
             self.title = ICON_LISTENING if self._is_listening else ICON_IDLE
             if self.wake_detector:
                 self.wake_detector.clear_cooldown()
+
+    # -- Transcripts ----------------------------------------------------------
 
     @staticmethod
     def _friendly_time(iso_str: str) -> str:
@@ -366,7 +397,7 @@ class CaveTalkApp(rumps.App):
             self._transcripts_menu.add(rumps.MenuItem(label, callback=None))
 
     def _refresh_transcripts(self):
-        """Rebuild transcripts submenu (safe only after app is running)."""
+        """Rebuild transcripts submenu."""
         self._transcripts_menu.clear()
         self._populate_transcripts()
 
@@ -379,16 +410,128 @@ class CaveTalkApp(rumps.App):
         from .config import TRANSCRIPTS_DIR
         subprocess.Popen(["open", str(TRANSCRIPTS_DIR)])
 
+    # -- Timer: buffer display + deferred device-change handling --------------
+
     @rumps.timer(1)
     def _update_buffer(self, sender):
-        """Update buffer and status display."""
+        """Update buffer display and handle deferred device changes.
+
+        NEVER calls sd.query_devices() — that can segfault during USB unplug.
+        Device changes are detected by the CoreAudio listener which sets
+        ``_device_list_changed``.  We handle it here with a 2-second delay
+        to let CoreAudio settle.
+        """
+        try:
+            self._tick()
+        except Exception as e:
+            log.warning("Timer error: %s", e)
+
+    def _tick(self):
+        # Handle deferred device switch (user picked a device from the menu)
+        if self._deferred_restart_device:
+            self._deferred_restart_device = False
+            log.info("Deferred device restart: stopping and restarting")
+            self._stop_listening()
+            self._start_listening()
+            return
+
+        # Handle device change (set by CoreAudio listener)
+        if self._device_list_changed:
+            self._device_list_changed = False
+            log.info("Device change detected by CoreAudio, scheduling reconnect")
+            # Give CoreAudio a moment to settle before touching PortAudio.
+            # We record the time and handle it on a future tick.
+            self._device_change_at = time.monotonic()
+
+        if hasattr(self, '_device_change_at'):
+            elapsed = time.monotonic() - self._device_change_at
+            if elapsed >= 2.0:
+                del self._device_change_at
+                self._handle_device_change()
+
         if not self._is_listening or not self.capture:
             return
+
         buffered = self.capture.buffer.seconds_buffered
         mins, secs = divmod(buffered, 60)
         self._buffer_item.title = f"Buffer: {mins:02d}:{secs:02d}"
 
+    def _handle_device_change(self):
+        """Called ~2s after CoreAudio reported a device list change.
+
+        Always reconnects because PortAudio's device list is stale until
+        we call refresh_devices().  We can't check "is our device still
+        there" without refreshing first, and refreshing requires no
+        active streams — so we abandon first, refresh, then reconnect.
+        """
+        log.info("Handling device change (listening=%s)", self._is_listening)
+
+        if self._reconnecting:
+            return
+
+        if not self._is_listening:
+            # Not listening — just refresh PA so the device menu is accurate
+            # when the user next opens it or clicks Start.
+            try:
+                refresh_devices()
+                self._device_menu_stale = True
+            except Exception as e:
+                log.warning("refresh_devices failed: %s", e)
+            return
+
+        # We ARE listening — reconnect (abandon stream, refresh PA, start fresh)
+        self._reconnect_default_device()
+
+    def _reconnect_default_device(self):
+        """Abandon the dead stream and start a new one on the system default."""
+        self._reconnecting = True
+        old_device = self._device_name
+        try:
+            log.info("Reconnect: stopping wake detector")
+            if self.wake_detector:
+                try:
+                    self.wake_detector.stop()
+                except Exception:
+                    pass
+                self.wake_detector = None
+
+            log.info("Reconnect: abandoning capture")
+            if self.capture:
+                self.capture.abandon()
+                self.capture = None
+
+            self._is_listening = False
+            self._status_item.title = "Reconnecting..."
+            self._buffer_item.title = "Buffer: --:--"
+
+            # Now safe to reinitialize PA (no active streams)
+            log.info("Reconnect: refreshing PortAudio device list")
+            try:
+                refresh_devices()
+            except Exception as e:
+                log.warning("Reconnect: refresh_devices failed: %s", e)
+
+            self.config.device = None
+            log.info("Reconnect: starting on default device")
+            self._start_listening()
+            log.info("Reconnect: _start_listening done, is_listening=%s", self._is_listening)
+
+            if self._is_listening:
+                log.info("Reconnected: '%s' -> '%s'", old_device, self._device_name)
+                rumps.notification(
+                    "cave-talk",
+                    "Device changed",
+                    f"Switched to {self._device_name}",
+                )
+        except Exception as e:
+            log.error("Reconnect failed: %s", e)
+            self._status_item.title = "Error — click Start Listening"
+            self.title = ICON_IDLE
+        finally:
+            self._reconnecting = False
+
     def quit_app(self, sender):
+        self._device_listener.stop()
         self._stop_listening()
         rumps.quit_application()
 
