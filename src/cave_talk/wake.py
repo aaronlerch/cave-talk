@@ -81,7 +81,7 @@ class WakePhraseDetector:
             return
 
         text = self._transcribe_snippet(audio)
-        log.debug("Wake check transcript: %r", text[:200] if text else "(empty)")
+        log.debug("Wake check: %r", text[:200] if text else "(empty)")
 
         if not text:
             return

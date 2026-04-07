@@ -271,7 +271,8 @@ class CaveTalkApp(rumps.App):
     def _on_wake_phrase(self):
         """Called from wake detector thread when phrase is detected."""
         log.info("Wake phrase detected!")
-        rumps.Timer(0, lambda _: self._perform_capture(wake_triggered=True)).start()
+        rumps.notification("cave-talk", "Wake phrase detected", "Capturing transcript...")
+        threading.Thread(target=self._perform_capture, kwargs={"wake_triggered": True}, daemon=True).start()
 
     # -- User actions ---------------------------------------------------------
 
@@ -430,7 +431,7 @@ class CaveTalkApp(rumps.App):
         # Handle deferred device switch (user picked a device from the menu)
         if self._deferred_restart_device:
             self._deferred_restart_device = False
-            log.info("Deferred device restart: stopping and restarting")
+            log.debug("Deferred device restart")
             self._stop_listening()
             self._start_listening()
             return
@@ -464,7 +465,7 @@ class CaveTalkApp(rumps.App):
         there" without refreshing first, and refreshing requires no
         active streams — so we abandon first, refresh, then reconnect.
         """
-        log.info("Handling device change (listening=%s)", self._is_listening)
+        log.debug("Handling device change (listening=%s)", self._is_listening)
 
         if self._reconnecting:
             return
@@ -487,7 +488,6 @@ class CaveTalkApp(rumps.App):
         self._reconnecting = True
         old_device = self._device_name
         try:
-            log.info("Reconnect: stopping wake detector")
             if self.wake_detector:
                 try:
                     self.wake_detector.stop()
@@ -495,7 +495,6 @@ class CaveTalkApp(rumps.App):
                     pass
                 self.wake_detector = None
 
-            log.info("Reconnect: abandoning capture")
             if self.capture:
                 self.capture.abandon()
                 self.capture = None
@@ -505,16 +504,13 @@ class CaveTalkApp(rumps.App):
             self._buffer_item.title = "Buffer: --:--"
 
             # Now safe to reinitialize PA (no active streams)
-            log.info("Reconnect: refreshing PortAudio device list")
             try:
                 refresh_devices()
             except Exception as e:
-                log.warning("Reconnect: refresh_devices failed: %s", e)
+                log.warning("refresh_devices failed during reconnect: %s", e)
 
             self.config.device = None
-            log.info("Reconnect: starting on default device")
             self._start_listening()
-            log.info("Reconnect: _start_listening done, is_listening=%s", self._is_listening)
 
             if self._is_listening:
                 log.info("Reconnected: '%s' -> '%s'", old_device, self._device_name)

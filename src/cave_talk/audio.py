@@ -228,10 +228,9 @@ def refresh_devices() -> None:
     Calling while a stream exists will invalidate it (crash / deadlock).
     After calling, sd.query_devices() and list_devices() return fresh data.
     """
-    log.info("refresh_devices: reinitializing PortAudio")
     sd._terminate()
     sd._initialize()
-    log.info("refresh_devices: done")
+    log.debug("PortAudio reinitialized")
 
 
 def list_devices() -> list[dict]:
